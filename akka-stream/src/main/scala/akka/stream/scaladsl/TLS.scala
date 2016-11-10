@@ -1,13 +1,17 @@
 package akka.stream.scaladsl
 
-import javax.net.ssl.{ SSLContext }
+import java.util.Collections
+import javax.net.ssl.{ SNIHostName, SSLContext, SSLEngine, SSLSession }
 
-import akka.stream.impl.io.TlsModule
+import akka.stream.impl.io.{ TlsModule, TlsUtils }
 import akka.NotUsed
+import akka.actor.ActorSystem
 import akka.stream._
 import akka.stream.TLSProtocol._
 import akka.util.ByteString
 import com.typesafe.sslconfig.akka.AkkaSSLConfig
+
+import scala.util.{ Failure, Success, Try }
 
 /**
  * Stream cipher support based upon JSSE.
@@ -64,11 +68,58 @@ object TLS {
    * configured using [[javax.net.ssl.SSLParameters.setEndpointIdentificationAlgorithm]].
    */
   def apply(
-    sslContext:   SSLContext, // TODO: in 2.5.x replace sslContext and sslConfig by generic SSLEngine constructor function, see https://github.com/akka/akka/issues/21753
+    sslContext:   SSLContext,
     sslConfig:    Option[AkkaSSLConfig],
     firstSession: NegotiateNewSession, role: TLSRole,
-    closing: TLSClosing = IgnoreComplete, hostInfo: Option[(String, Int)] = None): scaladsl.BidiFlow[SslTlsOutbound, ByteString, ByteString, SslTlsInbound, NotUsed] =
-    new scaladsl.BidiFlow(TlsModule(Attributes.none, sslContext, sslConfig, firstSession, role, closing, hostInfo))
+    closing: TLSClosing = IgnoreComplete, hostInfo: Option[(String, Int)] = None): scaladsl.BidiFlow[SslTlsOutbound, ByteString, ByteString, SslTlsInbound, NotUsed] = {
+    def theSslConfig(system: ActorSystem): AkkaSSLConfig =
+      sslConfig.getOrElse(AkkaSSLConfig(system))
+
+    val createSSLEngine = { system: ActorSystem ⇒
+      val engine = hostInfo match {
+        case Some((hostname, port)) ⇒ sslContext.createSSLEngine(hostname, port)
+        case None                   ⇒ sslContext.createSSLEngine()
+      }
+      val config = theSslConfig(system)
+      config.sslEngineConfigurator.configure(engine, sslContext)
+      engine.setUseClientMode(role == Client)
+
+      val finalSessionParameters =
+        if (firstSession.sslParameters.isDefined && hostInfo.isDefined && !config.config.loose.disableSNI) {
+          val newParams = TlsUtils.cloneParameters(firstSession.sslParameters.get)
+          // In Java 7, SNI was automatically enabled by enabling "jsse.enableSNIExtension" and using
+          // `createSSLEngine(hostname, port)`.
+          // In Java 8, SNI is only enabled if the server names are added to the parameters.
+          // See https://github.com/akka/akka/issues/19287.
+          newParams.setServerNames(Collections.singletonList(new SNIHostName(hostInfo.get._1)))
+          firstSession.copy(sslParameters = Some(newParams))
+        } else
+          firstSession
+
+      TlsUtils.applySessionParameters(engine, finalSessionParameters)
+      engine
+    }
+    def verifySession: (ActorSystem, SSLSession) ⇒ Try[Unit] =
+      hostInfo match {
+        case Some((hostname, _)) ⇒ { (system, session) ⇒
+          val hostnameVerifier = theSslConfig(system).hostnameVerifier
+          if (!hostnameVerifier.verify(hostname, session))
+            Failure(new ConnectionException(s"Hostname verification failed! Expected session to be for $hostname"))
+          else
+            Success(())
+        }
+        case None ⇒ (_, _) ⇒ Success(())
+      }
+
+    new scaladsl.BidiFlow(TlsModule(Attributes.none, createSSLEngine, verifySession, closing))
+  }
+
+  def apply(
+    createSSLEngine: () ⇒ SSLEngine, // we don't offer the internal `ActorSystem => SSLEngine` API here, see #21753
+    verifySession:   SSLSession ⇒ Try[Unit], // we don't offer the internal API that provides `ActorSystem` here, see #21753
+    closing:         TLSClosing
+  ): scaladsl.BidiFlow[SslTlsOutbound, ByteString, ByteString, SslTlsInbound, NotUsed] =
+    new scaladsl.BidiFlow(TlsModule(Attributes.none, _ ⇒ createSSLEngine(), (_, session) ⇒ verifySession(session), closing))
 
   /**
    * Create a StreamTls [[akka.stream.scaladsl.BidiFlow]]. The
@@ -90,7 +141,7 @@ object TLS {
     sslContext:   SSLContext,
     firstSession: NegotiateNewSession, role: TLSRole,
     closing: TLSClosing, hostInfo: Option[(String, Int)]): scaladsl.BidiFlow[SslTlsOutbound, ByteString, ByteString, SslTlsInbound, NotUsed] =
-    new scaladsl.BidiFlow(TlsModule(Attributes.none, sslContext, None, firstSession, role, closing, hostInfo))
+    apply(sslContext, None, firstSession, role, closing, hostInfo)
 
   /**
    * Create a StreamTls [[akka.stream.scaladsl.BidiFlow]]. The
@@ -111,8 +162,7 @@ object TLS {
   def apply(
     sslContext:   SSLContext,
     firstSession: NegotiateNewSession, role: TLSRole): scaladsl.BidiFlow[SslTlsOutbound, ByteString, ByteString, SslTlsInbound, NotUsed] =
-    new scaladsl.BidiFlow(TlsModule(Attributes.none, sslContext, None, firstSession, role, IgnoreComplete, None))
-
+    apply(sslContext, None, firstSession, role, IgnoreComplete, None)
 }
 
 /**
